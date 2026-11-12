@@ -1,8 +1,11 @@
 package mr
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -37,7 +40,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		args := GetTaskArgs{WorkerID: workerID}
 		reply := GetTaskReply{}
 
-		call("Master.GetTask", &args, &reply)
+		if !call("Master.GetTask", &args, &reply) {
+			return
+		}
 
 		filename, taskID, nReduce, taskType := reply.File, reply.ID, reply.NReduce, reply.Type
 		if taskID == -1 {
@@ -64,16 +69,18 @@ func HandleMap(filename string, taskID int, nReduce int, mapf func(string, strin
 	}
 
 	kva := mapf(filename, string(content))
-	buckets := make([]string, nReduce)
+	buckets := make([]bytes.Buffer, nReduce)
 
 	for _, kv := range kva {
 		bucket := ihash(kv.Key) % nReduce
-		buckets[bucket] += fmt.Sprintf("%s %s\n", kv.Key, kv.Value)
+		if err := json.NewEncoder(&buckets[bucket]).Encode(kv); err != nil {
+			log.Fatalf("encode intermediate record for bucket %d: %v", bucket, err)
+		}
 	}
 
 	for bucket := range nReduce {
 		filename := fmt.Sprintf("mr_%d_%d.out", bucket, taskID)
-		err = os.WriteFile(filename, []byte(buckets[bucket]), 0644)
+		err = os.WriteFile(filename, buckets[bucket].Bytes(), 0644)
 		if err != nil {
 			log.Fatalf("write file %s: %v", filename, err)
 		}
@@ -99,14 +106,17 @@ func HandleReduce(taskID int, reducef func(string, []string) string) {
 				log.Fatalf("read file %s: %v", entry.Name(), err)
 			}
 
-			text := strings.TrimSpace(string(content))
-			if text == "" {
-				continue
-			}
-
-			for line := range strings.SplitSeq(text, "\n") {
-				kv := strings.Split(line, " ")
-				dict[kv[0]] = append(dict[kv[0]], kv[1])
+			decoder := json.NewDecoder(bytes.NewReader(content))
+			for {
+				var kv KeyValue
+				err := decoder.Decode(&kv)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Fatalf("decode intermediate file %s: %v", entry.Name(), err)
+				}
+				dict[kv.Key] = append(dict[kv.Key], kv.Value)
 			}
 		}
 	}

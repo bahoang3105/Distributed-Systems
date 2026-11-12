@@ -138,6 +138,8 @@ func (m *Master) server() {
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
 func (m *Master) Done() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.pendingReduce == 0
 }
 
