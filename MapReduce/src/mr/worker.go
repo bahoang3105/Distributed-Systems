@@ -1,71 +1,138 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
 
+const OutDir = "."
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	workerID := strconv.Itoa(os.Getpid())
 
-	// Your worker implementation here.
+	for {
+		time.Sleep(time.Second)
+		args := GetTaskArgs{WorkerID: workerID}
+		reply := GetTaskReply{}
 
-	// uncomment to send the Example RPC to the master.
-	CallExample()
+		call("Master.GetTask", &args, &reply)
 
+		filename, taskID, nReduce, taskType := reply.File, reply.ID, reply.NReduce, reply.Type
+		if taskID == -1 {
+			continue
+		}
+
+		if taskType == Map {
+			HandleMap(filename, taskID, nReduce, mapf)
+		} else {
+			HandleReduce(taskID, reducef)
+		}
+
+		reportTaskArgs := ReportTaskArgs{WorkerID: workerID, TaskID: taskID, TaskType: taskType}
+		reportTaskReply := ReportTaskReply{}
+
+		call("Master.ReportTask", &reportTaskArgs, &reportTaskReply)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func HandleMap(filename string, taskID int, nReduce int, mapf func(string, string) []KeyValue) {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		log.Fatalf("read %s: %v", filename, err)
+	}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	kva := mapf(filename, string(content))
+	buckets := make([]string, nReduce)
 
-	// fill in the argument(s).
-	args.X = 99
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % nReduce
+		buckets[bucket] += fmt.Sprintf("%s %s\n", kv.Key, kv.Value)
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	for bucket := range nReduce {
+		filename := fmt.Sprintf("mr_%d_%d.out", bucket, taskID)
+		err = os.WriteFile(filename, []byte(buckets[bucket]), 0644)
+		if err != nil {
+			log.Fatalf("write file %s: %v", filename, err)
+		}
+	}
 }
 
-//
+func HandleReduce(taskID int, reducef func(string, []string) string) {
+	dict := map[string][]string{}
+
+	entries, err := os.ReadDir(OutDir)
+	if err != nil {
+		log.Fatalf("read folder %s: %v", OutDir, err)
+	}
+
+	pattern := fmt.Sprintf("mr_%d_", taskID)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), pattern) {
+			content, err := os.ReadFile(entry.Name())
+			if err != nil {
+				log.Fatalf("read file %s: %v", entry.Name(), err)
+			}
+
+			text := strings.TrimSpace(string(content))
+			if text == "" {
+				continue
+			}
+
+			for line := range strings.SplitSeq(text, "\n") {
+				kv := strings.Split(line, " ")
+				dict[kv[0]] = append(dict[kv[0]], kv[1])
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(dict))
+	for key := range dict {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var output strings.Builder
+	for _, key := range keys {
+		value := reducef(key, dict[key])
+		fmt.Fprintf(&output, "%s %s\n", key, value)
+	}
+
+	filename := fmt.Sprintf("mr-out-%d.out", taskID)
+	err = os.WriteFile(filename, []byte(output.String()), 0644)
+	if err != nil {
+		log.Fatalf("write file %s: %v", filename, err)
+	}
+}
+
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
